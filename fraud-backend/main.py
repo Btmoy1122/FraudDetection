@@ -5,6 +5,8 @@ from models import Base
 from database import Sessionlocal
 from models import TransactionDB
 from sqlalchemy.exc import IntegrityError
+from features import compute_features
+from rules import apply_rules
 
 Base.metadata.create_all(bind=engine)
 
@@ -27,19 +29,28 @@ class Transaction(BaseModel):
 
 @app.post("/transactions")
 def create_transaction(txn: Transaction):
-    decision = "DENY" if txn.amount > 1000 else "APPROVE"
 
     db = Sessionlocal()
 
     try:
+        # 1) compute features
+        features = compute_features(txn.user_id, db)
+
+        # 2) apply rules
+        decision, reason = apply_rules(features, txn.amount)
+
+        # 3) insert row
         db_txn = TransactionDB(
             transaction_id=txn.transaction_id,
             user_id=txn.user_id,
             amount=txn.amount,
-            decision=decision)
-        
+            decision=decision,
+            reason=reason,
+            features=features,
+        )
         db.add(db_txn)
         db.commit()
+
     except IntegrityError:
         db.rollback()
         existing = db.query(TransactionDB).filter(
@@ -47,16 +58,21 @@ def create_transaction(txn: Transaction):
         ).first()
         if existing:
             return {
-                "transaction_id": txn.transaction_id,
+                "transaction_id": existing.transaction_id,
                 "decision": existing.decision,
+                "reason": existing.reason,
+                "features": existing.features,
                 "idempotent": True
             }
+        raise
     finally:
         db.close()
-    
+
     return {
         "transaction_id": txn.transaction_id,
         "decision": decision,
+        "reason": reason,       # optional for learning/debugging
+        "features": features,   # optional for learning/debugging
         "idempotent": False
     }
 
