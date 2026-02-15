@@ -31,6 +31,6 @@
     "V28",
     "Amount"
   ],
-  "threshold": 0.5,
+  "threshold": 0.9843874277523331,
   "algorithm": "logistic_regression"
 }
