@@ -1,2 +1,25 @@
+# Data files
+creditcard.csv
 fraud-backend/creditcard.csv
+
+# Model binaries
+*.pkl
 fraud-backend/artifacts/*.pkl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+fraud-backend/venv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+postgres_data/
