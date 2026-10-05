@@ -71,12 +71,16 @@ jobs:
       - name: Load test
         run: |
           mkdir -p loadtest/results
+          # k6 exits 99 when a threshold fails; still publish the summary
+          # (a failed run at a high rate is how the ceiling is found).
+          status=0
           k6 run \
             -e RATE=${{ inputs.rate || '100' }} \
             -e DURATION=${{ inputs.duration || '30s' }} \
             -e P99_MS=1000 \
-            loadtest/k6.js
-          cat loadtest/results/summary.md >> "$GITHUB_STEP_SUMMARY"
+            loadtest/k6.js || status=$?
+          cat loadtest/results/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+          exit $status
 
       - name: Upload load test results
         if: always()
