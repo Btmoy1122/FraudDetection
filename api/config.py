@@ -6,6 +6,14 @@ DATABASE_URL = os.getenv(
     "postgresql://fraud_user:password@localhost:5432/fraud_db",
 )
 
+# Per process.  The API runs several uvicorn workers, each with its own pool,
+# so total connections = workers x (pool + overflow); keep that under
+# Postgres's default max_connections of 100.
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "5"))
+
+PROMETHEUS_MULTIPROC_DIR = os.getenv("PROMETHEUS_MULTIPROC_DIR")
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # Fail fast when Redis is down so the Postgres fallback kicks in quickly
 # instead of every request hanging on a dead socket.

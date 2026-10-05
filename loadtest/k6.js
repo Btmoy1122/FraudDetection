@@ -20,6 +20,7 @@ const RATE = parseInt(__ENV.RATE || '200', 10);
 const DURATION = __ENV.DURATION || '60s';
 const USERS = parseInt(__ENV.USERS || '10000', 10);
 const P99_MS = parseInt(__ENV.P99_MS || '500', 10);
+const API_WORKERS = __ENV.API_WORKERS || 'unknown';
 
 export const options = {
   scenarios: {
@@ -71,6 +72,7 @@ function metric(data, name, stat) {
 export function handleSummary(data) {
   const r = {
     target_rate_per_s: RATE,
+    api_workers: API_WORKERS,
     duration: DURATION,
     achieved_rate_per_s: metric(data, 'http_reqs', 'rate'),
     requests: metric(data, 'http_reqs', 'count'),
@@ -88,6 +90,7 @@ export function handleSummary(data) {
     '',
     '| Metric | Value |',
     '|---|---|',
+    `| API workers | ${API_WORKERS} |`,
     `| Target rate | ${RATE} tx/s for ${DURATION} |`,
     `| Achieved rate | ${r.achieved_rate_per_s.toFixed(1)} tx/s (${r.requests} requests) |`,
     `| Dropped iterations | ${r.dropped_iterations} |`,
