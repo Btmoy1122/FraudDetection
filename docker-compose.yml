@@ -1,3 +1,5 @@
+x-db-url: &db-url postgresql://${POSTGRES_USER:-fraud_user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-fraud_db}
+
 services:
 
   # ---------------------------------------------------------------------------
@@ -7,15 +9,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: fraud_user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: fraud_db
+      POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-fraud_db}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fraud_user -d fraud_db"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -45,6 +47,11 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init with the partition
+      # count we want, never implicitly with broker defaults.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list || exit 1"]
@@ -52,6 +59,21 @@ services:
       timeout: 10s
       retries: 10
       start_period: 30s
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        T=/opt/kafka/bin/kafka-topics.sh
+        $$T --bootstrap-server kafka:29092 --create --if-not-exists --topic transactions --partitions 6 --replication-factor 1
+        $$T --bootstrap-server kafka:29092 --create --if-not-exists --topic transactions.dlq --partitions 1 --replication-factor 1
+        $$T --bootstrap-server kafka:29092 --describe --topic transactions
+    restart: "no"
 
   # ---------------------------------------------------------------------------
   # Application services
@@ -63,31 +85,84 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://fraud_user:password@postgres:5432/fraud_db
+      DATABASE_URL: *db-url
       REDIS_URL: redis://redis:6379/0
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       ARTIFACTS_DIR: /app/artifacts
     volumes:
       - ./ml/artifacts:/app/artifacts:ro
+    # The API depends on Postgres and Redis only.  Kafka is reached through
+    # the outbox relay, so a Kafka outage never touches the request path.
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  outbox-relay:
+    build:
+      context: ./api
+    command: ["python", "relay.py"]
+    environment:
+      DATABASE_URL: *db-url
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      api:
+        condition: service_healthy  # API creates the outbox table
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   consumers:
     build:
       context: ./consumers
     environment:
-      DATABASE_URL: postgresql://fraud_user:password@postgres:5432/fraud_db
+      DATABASE_URL: *db-url
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     depends_on:
       postgres:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Monitoring
+  # ---------------------------------------------------------------------------
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command: ["--kafka.server=kafka:29092"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/fraud.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
 
 volumes:
   postgres_data:

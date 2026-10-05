@@ -1,0 +1,6 @@
+-r api/requirements.txt
+-r consumers/requirements.txt
+pytest
+fakeredis[lua]
+requests
+ruff

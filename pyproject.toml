@@ -1,0 +1,13 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["api", "consumers", "tests/integration"]
+extend-exclude = ["fraud-backend", ".venv", "venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+# B008: FastAPI's `Depends(...)` in argument defaults is the intended pattern.
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+addopts = "-q"

@@ -4,15 +4,21 @@ Each consumer joins a different consumer group, so they all independently
 receive every message from the transactions topic.  Threading is fine here
 because each consumer is I/O-bound (waiting for Kafka messages), not
 CPU-bound.
+
+If any consumer thread dies, the process exits non-zero and Docker
+restarts it.  Uncommitted offsets are redelivered, so nothing is lost.
 """
 
 import logging
+import sys
 import threading
 import time
 
+from prometheus_client import start_http_server
+
 from analytics import run as run_analytics
-from audit_logger import run as run_audit_logger
-from db_writer import run as run_db_writer
+from audit_writer import run as run_audit_writer
+from settings import METRICS_PORT
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,13 +27,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CONSUMERS = [
-    ("db-writer", run_db_writer),
-    ("audit-logger", run_audit_logger),
+    ("audit-writer", run_audit_writer),
     ("analytics", run_analytics),
 ]
 
 
-def main() -> None:
+def main() -> int:
+    start_http_server(METRICS_PORT)
     threads: list[threading.Thread] = []
 
     for name, target in CONSUMERS:
@@ -42,10 +48,11 @@ def main() -> None:
             for t in threads:
                 if not t.is_alive():
                     logger.error("Consumer %s died — exiting", t.name)
-                    return
+                    return 1
     except KeyboardInterrupt:
         logger.info("Shutting down consumers")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

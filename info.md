@@ -1,108 +1,240 @@
-# Fraud Detection Platform — Design Notes
+# Fraud Detection Platform: Study Guide
 
-## Phase 1–2: API + ML Integration
-
-### What we built
-- FastAPI service with PostgreSQL persistence
-- Rule engine using rolling DB aggregates (velocity, amount spikes)
-- Logistic regression fraud classifier trained on Kaggle credit card data
-- Threshold tuning targeting recall >= 0.85
-- Versioned model artifacts (pkl + metadata JSON)
-
-### Core concepts
-- **Model**: learned function mapping features -> fraud probability
-- **Threshold**: converts probability to binary decision (DENY vs APPROVE)
-- **Offline vs Online**: train/tune offline, serve saved model in real-time
-- **Idempotent transactions**: duplicate transaction_id returns existing result
-
-### Interview one-liner
-"I trained a logistic regression baseline offline on labeled fraud data, tuned the threshold on held-out evaluation data, versioned model artifacts, and served low-latency online inference in FastAPI with explicit feature-contract and threshold control."
+Read this before anything goes on your resume. Every section is something an interviewer can push on. If you can't explain a part out loud without looking, re-read the code it points to.
 
 ---
 
-## Phase 3: Redis Feature Store
+## 1. The full data flow (be able to draw this)
 
-### What we built
-- Redis sorted sets for true sliding-window counters (1-hour transaction count and sum)
-- Cache-aside pattern with TTL for 30-day average amount
-- Graceful fallback to PostgreSQL when Redis is unavailable
-- Redis pipelines to batch commands in a single network round-trip
+```
+Client → API ──(Lua)──► Redis
+           └──(1 txn)─► Postgres [transactions + outbox]
+                              ▲
+              Outbox relay ───┘ polls, publishes (acks=all)
+                   ▼
+           Kafka "transactions" (6 partitions, key=user_id)
+              ├─ group "audit"     → audit-writer → audit_log table
+              └─ group "analytics" → analytics    → Prometheus metrics
+           anything unprocessable → "transactions.dlq"
+```
 
-### Core concepts
-- **Cache-aside pattern**: check cache first, DB on miss, populate cache with TTL
-- **Sliding window vs tumbling window**: sorted sets give true sliding windows; simple key TTLs give tumbling windows that reset at arbitrary times
-- **TTL (Time To Live)**: cached 30-day average expires after 5 minutes because a 30-day average barely moves per transaction — slight staleness is acceptable
-- **Hot vs cold data**: 1-hour counters are hot (Redis), 30-day averages are warm (cached from DB), full history is cold (PostgreSQL)
-- **Connection pooling**: reuse TCP connections to Redis instead of opening new ones per request
-- **Pipelining**: batch multiple Redis commands into one network round-trip to reduce latency
+**Synchronous (client waits), in `api/main.py`:**
+1. `db.get(transaction_id)`. If it exists, return the stored decision (idempotency).
+2. `get_features()` in `feature_store.py`:
+   - Lua script: prune old entries, count and sum the window, add this transaction. One atomic step.
+   - 30-day average from the Redis cache, or Postgres on a miss (cached for 5 minutes).
+   - If Redis errors at all, compute everything from Postgres.
+3. `apply_rules()`: 5 or more prior transactions in the last hour → DENY. Amount more than 3× the 30-day average → DENY.
+4. Insert the `transactions` row and the `outbox` row, then a single `commit()`.
+5. Return the decision.
 
-### Why Redis for real-time features
-- In-memory storage: sub-millisecond reads vs ~5-50ms for PostgreSQL queries
-- Native data structures (sorted sets, hashes) designed for exactly these patterns
-- Single-threaded command execution means no lock contention
+**Asynchronous:**
+6. `relay.py` selects unpublished outbox rows, sends them to Kafka, waits for the acks, and marks them published.
+7. `consumers/` read from Kafka, process, then commit offsets.
 
-### Cache invalidation strategy
-- 1-hour counters: self-expiring via sorted set pruning (ZREMRANGEBYSCORE)
-- 30-day average: invalidated on every new transaction (DELETE key), re-populated on next cache miss
-- Why delete instead of update: computing a new 30-day rolling average requires all 30 days of data that Redis doesn't have
-
-### When cache lies and why it's okay
-- The 30-day average can be up to 5 minutes stale
-- For fraud detection, a 5-minute-old average that's 0.1% off won't change any rule outcome
-- The 1-hour sliding window is always accurate because we write to it synchronously before returning
-
-### Interview one-liner
-"I built a Redis feature store using sorted sets for true sliding-window aggregates and cache-aside with TTLs for longer-term features, with graceful PostgreSQL fallback. Hot-path reads dropped from ~50ms database queries to sub-millisecond Redis lookups."
-
-### Interview question: "How do you handle millions of real-time feature lookups per second?"
-- Redis sorted sets for sliding-window counters — O(log N) writes, O(log N + M) reads
-- Connection pooling and pipelining to minimize network round-trips
-- Partition users across Redis instances (cluster mode) for horizontal scaling
-- Cache-aside for expensive aggregates with TTL-based invalidation
-- Graceful degradation: if Redis fails, fall back to DB queries at lower throughput
+**One-liner:** "The API makes the decision synchronously and writes it, plus an outbox event, in one Postgres transaction. A relay publishes those events to Kafka, where independent consumer groups handle audit and analytics with at-least-once delivery."
 
 ---
 
-## Phase 5: Kafka Event Streaming
+## 2. Why Kafka instead of calling things directly?
 
-### What we built
-- Kafka producer publishing transaction events after scoring
-- Three independent consumers in separate consumer groups:
-  - DB writer: persists to PostgreSQL with ON CONFLICT DO NOTHING
-  - Audit logger: structured audit trail
-  - Analytics: running fraud metrics (denial rate, volume)
-- Events keyed by user_id for per-user partition ordering
+What it buys you:
+- **Decoupling.** The API doesn't know or care who consumes events. Adding a new consumer (e.g. an ML feature pipeline) needs zero API changes.
+- **Fan-out.** Each consumer group gets every event independently. Audit and analytics never coordinate.
+- **Buffering / backpressure.** If consumers are slow, events pile up on Kafka's disk, not in API memory. The API never slows down.
+- **Replay.** Events are retained (7 days by default). A new consumer can start from the beginning and backfill.
+- **Ordering per key.** Keyed by `user_id`, so one user's events always land on the same partition, in order.
 
-### Core concepts
-- **Event-driven architecture**: scoring is synchronous (user needs an answer), everything else is asynchronous
-- **Consumer groups**: each group independently receives every message. DB writer, audit, and analytics all get the same events without coordinating
-- **At-least-once delivery**: Kafka guarantees every message is delivered at least once, but may duplicate on consumer failure
-- **Idempotent consumers**: ON CONFLICT DO NOTHING makes duplicate processing safe
-- **Partition ordering**: keying by user_id ensures all events for one user land on the same partition, preserving per-user ordering
-- **Fire-and-forget publishing**: the API doesn't wait for Kafka broker acknowledgement on the hot path
+The honest trade-off: more moving parts, eventual consistency (the audit log lags slightly), and you have to think about duplicates.
 
-### Why async pipelines exist
-- The user only cares about the scoring decision. Persistence, auditing, and analytics don't need to finish before the response
-- Async consumers can be scaled independently: if audit logging is slow, add more audit consumers without touching the API
-- Backpressure is absorbed by Kafka: if consumers fall behind, messages buffer in Kafka (disk-backed), not in the API's memory
+---
 
-### Backpressure
-- Kafka topics retain messages on disk (configurable retention period)
-- If consumers are slower than producers, Kafka buffers the difference
-- Consumer lag is measurable: you can monitor how far behind each consumer group is
-- The API never slows down because of slow consumers
+## 3. The Redis sliding window
 
-### Event replay
-- Kafka retains messages for a configurable period (default 7 days)
-- A consumer can reset its offset to re-process old events
-- Use case: deploy a new analytics consumer and replay the last week of events to backfill metrics
+**Key:** `user:{user_id}:txns_1h`, a **sorted set**.
+**Member:** `"{amount}:{transaction_id}"`. Amount comes first so a `:` inside a transaction ID can't break parsing.
+**Score:** Unix timestamp of the transaction.
 
-### Interview one-liner
-"I designed an event-driven pipeline using Kafka to decouple real-time transaction scoring from downstream processing. Events are partitioned by user_id for ordering guarantees, consumed by independent consumer groups for persistence, auditing, and analytics, with idempotent writes ensuring at-least-once delivery is safe."
+**What the Lua script does** (`feature_store.py`, `_RECORD_AND_READ_LUA`):
+1. `ZREMRANGEBYSCORE key -inf (now - 3600)`: delete entries older than 1 hour.
+2. `ZRANGE key 0 -1`: read what's left, then count and sum the amounts, **skipping this transaction's own member** so a retry doesn't count itself.
+3. `ZADD key NX now member`: record this transaction. NX means a retry doesn't move its timestamp.
+4. `EXPIRE key 3600`: if the user goes quiet, the whole key disappears.
+5. Return `{count, total}` as it was **before** this transaction.
 
-### Interview question: "How would you process events without blocking user requests?"
-- Publish events to Kafka asynchronously (fire-and-forget) after returning the scoring decision
-- Independent consumer groups handle persistence, audit, and analytics
-- Each consumer group can scale horizontally by adding more instances
-- Kafka absorbs backpressure: consumers can fall behind without affecting the API
-- Idempotent consumers handle duplicate delivery safely
+**How entries expire:** two ways. Each entry is pruned the next time that user transacts (step 1), and the whole key expires after an hour of inactivity (step 4).
+
+**Sliding vs tumbling:** a tumbling window (e.g. `INCR` with a 1h TTL) resets at arbitrary times, so 5 transactions at 12:59 and 5 at 1:01 both pass. A sorted set gives the exact last 60 minutes at any moment.
+
+**Complexity:** ZADD is O(log N). The range read is O(log N + M). N is tiny (bounded by the velocity limit).
+
+### The race condition this fixes (whiteboard this)
+
+The old code did: **read** the count → **decide** → **write** the new entry, as separate steps.
+
+```
+Request A (user U)          Request B (user U)
+read count = 4
+                            read count = 4
+decide: 4 < 5 → APPROVE
+                            decide: 4 < 5 → APPROVE
+write
+                            write          ← user now has 6, both approved
+```
+
+Fire 20 at once and many get through. **The fix:** Redis is single-threaded and runs a Lua script start to finish with no other command in between. Read and write become one indivisible operation, so 20 concurrent requests see counts 0, 1, 2 … 19, each exactly once. Exactly 5 are approved.
+
+**Proven by:**
+- `api/tests/test_feature_store.py::test_concurrent_requests_each_see_distinct_counts` (unit test)
+- `tests/integration/test_pipeline.py::test_velocity_limit_holds_under_concurrent_burst` (20 real HTTP requests, asserts exactly 5 APPROVE)
+
+**Why Lua instead of MULTI/EXEC?** MULTI/EXEC batches commands atomically, but you can't read a value and branch on it inside the transaction. WATCH plus a retry loop works but is clunkier. Lua lets you read and write in one atomic unit.
+
+**Caveat to say out loud:** when Redis is down, the Postgres fallback is NOT atomic, so a burst during an outage could slip through. Fixing that would need a DB-level lock (e.g. `SELECT … FOR UPDATE` on a per-user row) or failing closed.
+
+**Why denied transactions still count:** velocity counts *attempts*. A fraudster hammering a card should keep getting denied.
+
+### 30-day average cache
+
+Cache-aside: check Redis, on a miss query Postgres, and store the result with a 5-minute TTL. It is **not** invalidated on every transaction (the old code did that, which made the cache nearly useless for active users). A 30-day average barely moves per transaction, so up to 5 minutes of staleness is fine.
+
+---
+
+## 4. Failure modes ("what happens if…")
+
+**Redis goes down?**
+The Redis client has a 0.5s socket timeout, so the call fails fast with a `RedisError`. `get_features` catches it and computes features from Postgres (one aggregate query on the `(user_id, created_at)` index). The `fraud_feature_store_fallback_total` metric goes up. Requests are slower but still succeed. When Redis comes back, the client reconnects automatically. The Lua script was lost with Redis's memory, so the script object gets `NOSCRIPT` and re-sends it. The window starts empty, which is a known gap: velocity under-counts for up to an hour after a Redis restart.
+*Tested:* `tests/integration/test_degradation.py::test_api_keeps_scoring_when_redis_is_down`.
+
+**Kafka goes down?**
+The API doesn't notice at all, because it only writes to Postgres. The relay's sends fail, its DB transaction rolls back, the rows stay unpublished, and it retries every second. `fraud_outbox_pending` climbs. When Kafka is back, the relay drains the backlog in order.
+*Tested:* `test_degradation.py::test_events_survive_kafka_outage` stops Kafka, posts a transaction, restarts Kafka, and checks the event reaches `audit_log`.
+
+**Consumers fall behind?**
+Messages wait on Kafka's disk. Lag is visible as `kafka_consumergroup_lag` in Grafana. To catch up, run more consumer instances. With 6 partitions, up to 6 consumers per group can work in parallel. A 7th would sit idle, because a partition is owned by exactly one consumer in a group. The API is unaffected either way.
+
+**The same message is processed twice?**
+That's expected with at-least-once delivery. It happens when a consumer crashes after processing but before committing, or when the relay crashes after sending but before marking rows published. It's handled by idempotency:
+- `audit_log`: `INSERT … ON CONFLICT (transaction_id) DO NOTHING`
+- analytics: a bounded set of recently seen `event_id`s (in memory, so it resets on restart; fine for metrics)
+
+**The same *request* arrives twice** (client retry)?
+`transaction_id` is the primary key. The second request finds the first one's row and returns the original decision. If two duplicates arrive at the same moment, both pass the initial check, but only one INSERT can win. The loser gets `IntegrityError`, rolls back (including its outbox row), and returns the winner's decision.
+*Tested:* `test_concurrent_duplicates_get_one_decision`.
+
+**A message can't be processed (poison)?**
+`consumers/runner.py`:
+- Not valid JSON → straight to the DLQ.
+- Missing fields (`NonRetryableError`) → straight to the DLQ.
+- Transient error (Postgres down, `OperationalError`) → retry forever with capped exponential backoff. Dead-lettering here would dump *every* message into the DLQ during an outage.
+- Any other error → 3 attempts, then the DLQ.
+
+DLQ messages keep the original bytes, plus headers for the error, consumer, source partition, and source offset, so they can be inspected and replayed. The offset is committed only after the DLQ write is acknowledged.
+*Tested:* `consumers/tests/test_runner.py` (all branches) and `test_poison_message_is_dead_lettered` (real Kafka).
+
+**Postgres goes down?**
+The API returns 500. Postgres is the source of truth, so it fails closed rather than approving blind. The Redis window entry for that request is removed (`forget_transaction`) so the failed attempt doesn't count toward velocity.
+
+---
+
+## 5. The transactional outbox (strong fintech talking point)
+
+**The problem (dual write):** the API has to (a) save the decision and (b) publish an event. Those are two different systems, so you can't commit both atomically.
+- Save, then publish: crash in between and the event is lost forever.
+- Publish, then save: crash in between and consumers see a decision that doesn't exist.
+
+The old code saved, then did a fire-and-forget publish. Kafka down meant events silently lost.
+
+**The fix:** write the event into an `outbox` table **in the same Postgres transaction** as the decision. Either both commit or neither does. A separate relay process reads the outbox and publishes to Kafka.
+
+**Relay details (`api/relay.py`):**
+- `SELECT … WHERE published_at IS NULL ORDER BY id LIMIT 500 FOR UPDATE SKIP LOCKED`
+- `acks="all"`: the broker confirms only after all in-sync replicas have the message.
+- `max_in_flight_requests_per_connection=1`: with retries, more than one in-flight request could reorder messages.
+- Waits on every send future, then marks the rows published in the same DB transaction.
+- A crash after sending but before the commit means the batch is re-sent. That's at-least-once, so consumers must be idempotent (and they are).
+- A partial index (`WHERE published_at IS NULL`) keeps the poll query fast. Published rows are deleted after an hour.
+
+**Trade-offs to mention:** it adds up to ~100ms of event latency (the poll interval). Postgres `LISTEN/NOTIFY` or CDC with Debezium reading the WAL would cut that. Run exactly one relay: two would grab different batches and could publish one user's events out of order.
+
+**Bonus:** the API no longer depends on Kafka at all. Kafka could be down for an hour and users would never know.
+
+---
+
+## 6. Kafka partitions and consumer groups
+
+- `transactions` has **6 partitions**, created explicitly by the `kafka-init` service. Auto-creation is disabled so nothing silently gets 1 partition.
+- **The key is `user_id`.** Kafka hashes the key to choose a partition, so one user's events always go to the same partition, in order.
+- **Ordering is per partition, not global.** That's fine here: we only need each user's events in order.
+- **Consumer group:** the partitions are divided among the group's members, and each partition is read by exactly one member. Different groups each get everything. That's how audit and analytics both see every event.
+- **Scaling limit:** max parallelism per group equals the partition count (6).
+- **Manual commits:** `enable_auto_commit=False`, and `consumer.commit()` runs only after the whole polled batch is handled. Auto-commit can commit an offset *before* processing finishes, so a crash would lose that message.
+- **Caveat:** a dead-lettered message is skipped, so per-user order has a gap there. And if a transient retry blocks longer than `max.poll.interval.ms` (5 minutes), the group rebalances, the commit fails, the consumer crashes, Docker restarts it, and it reprocesses from the last commit. That's safe because of idempotency.
+
+---
+
+## 7. Observability
+
+Metrics (Prometheus, scraped every 5s). The Grafana dashboard is at `localhost:3000`.
+
+| Metric | Source | Why it matters |
+|---|---|---|
+| `fraud_decision_latency_seconds` (histogram) | API | p50/p99 of the request path |
+| `fraud_decisions_total{decision,reason}` | API | throughput, deny rate |
+| `fraud_feature_store_fallback_total` | API | is Redis healthy? |
+| `fraud_idempotent_replays_total` | API | how often clients retry |
+| `fraud_outbox_pending`, `fraud_outbox_oldest_pending_age_seconds` | relay | is publishing keeping up / is Kafka down? |
+| `kafka_consumergroup_lag` | kafka-exporter | are consumers keeping up? |
+| `fraud_event_pipeline_latency_seconds` | analytics | decision → consumer, end to end |
+| `fraud_consumer_events_total{consumer,outcome}` | consumers | throughput, DLQ rate |
+
+Why a histogram for latency: averages hide tail latency, and p99 is what users feel. Histograms can also be aggregated across instances. Precomputed quantiles (summaries) can't.
+
+---
+
+## 8. Testing and CI
+
+- **Unit tests (36):** rules, the Lua window (pruning, isolation, retries, concurrency), the cache, the fallback, every retry/DLQ branch of the runner, analytics de-duplication. Redis is simulated with `fakeredis`, which runs real Lua.
+- **Integration tests (10):** against the real compose stack. End to end through Kafka into `audit_log`, the burst/velocity race, concurrent duplicates, the DLQ, the partition count, metrics, validation.
+- **Failure-mode tests (2):** stop Redis, and stop Kafka, using `docker compose stop`.
+- **CI** (`.github/workflows/ci.yml`): ruff lint → unit tests → build images → start the stack → integration → failure modes → k6 load test → results posted to the job summary.
+
+---
+
+## 9. Load testing
+
+`loadtest/k6.js` uses an **open model** (`constant-arrival-rate`): k6 sends N requests per second no matter how slowly the server answers. A closed model (fixed users who wait for each response) hides overload, because a slow server automatically gets fewer requests. That's called "coordinated omission."
+
+A run is "sustained" only if `dropped_iterations == 0` and errors are under 1%.
+
+**Never put a number on your resume that you didn't measure.** Run it, record the hardware, and use the real numbers. Expect the bottleneck to be the single uvicorn worker (Python, GIL) and the synchronous Postgres commit per request. Be ready to say that, and how you'd scale: more API replicas behind a load balancer (the API is stateless), PgBouncer, and async DB drivers.
+
+---
+
+## 10. ML (honest framing)
+
+- A logistic regression with `class_weight="balanced"` (fraud is ~0.17% of the data), trained offline on the Kaggle credit card dataset.
+- The threshold is chosen for the best precision while keeping recall at or above 85% (missing fraud costs more than a false alarm).
+- **It's not in the decision path.** Its inputs (V1–V28) are anonymized PCA components from that dataset, which a live transaction doesn't have. It's served separately at `/ml/score-kaggle`.
+- **If asked:** "The production decision path is rules-based on features I compute in real time. I trained a baseline model offline, but its features don't exist at serving time, so I kept it out of the decision path rather than fake it. Next step is training on the features the system actually computes (velocity, amount vs. average) and blending its score with the rules."
+
+---
+
+## 11. Known limitations / what I'd do next
+
+- The velocity check isn't atomic while Redis is down (Postgres fallback).
+- The Redis window is in memory; a Redis restart loses up to 1 hour of velocity history (could rebuild it from Postgres on a miss).
+- A single relay is a throughput ceiling; it could be partitioned by key hash or replaced with Debezium CDC.
+- A single uvicorn worker; you'd run multiple replicas in production.
+- No authentication or rate limiting on the API.
+- No schema registry; the event contract lives in Pydantic models.
+- There's no DLQ replay tool yet (messages are kept with their headers, so it's straightforward to add).
+
+---
+
+## Resume bullets (fill numbers in only after measuring)
+
+- Built a real-time fraud scoring service (FastAPI, Redis, Kafka, Postgres) with atomic Redis Lua sliding-window velocity checks, fixing a race that let concurrent requests bypass limits.
+- Guaranteed event delivery with a transactional outbox and at-least-once Kafka consumers (manual commits, idempotent writes, dead-letter topic), verified by failure-injection tests that stop Redis and Kafka in CI.
+- Sustained **X tx/s at Y ms p99** (k6, open-model load test) on [hardware]; instrumented with Prometheus/Grafana (latency, consumer lag, fallback rate).
+- Containerized 9 services with Docker Compose; GitHub Actions CI runs lint, 36 unit tests, integration tests, and a load test on every push.

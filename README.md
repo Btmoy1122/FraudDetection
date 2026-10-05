@@ -1,167 +1,172 @@
 # Real-Time Fraud Detection Platform
 
-A production-style fraud detection system that evaluates financial transactions in real-time, combining rule-based heuristics with machine learning across an event-driven architecture.
+A fraud-scoring service that approves or denies transactions in real time. It uses atomic sliding-window features in Redis, a transactional outbox to Kafka, at-least-once consumers with a dead-letter topic, and Prometheus/Grafana observability. It runs as 9 services plus a topic-setup job, all started with one command.
 
 ## Architecture
 
 ```
-                          ┌─────────────────────────────────────────────┐
-                          │              Docker Compose                 │
-                          │                                             │
-  ┌────────┐   POST      │  ┌─────────┐  features  ┌───────┐          │
-  │ Client ├─────────────►│  │   API   ├───────────►│ Redis │          │
-  │        │◄─────────────┤  │(FastAPI)│◄───────────┤       │          │
-  └────────┘  decision    │  │         │  update    └───┬───┘          │
-                          │  │         │                │ cache miss    │
-                          │  │         │  persist   ┌───▼────┐         │
-                          │  │         ├───────────►│Postgres│         │
-                          │  │         │            └───▲────┘         │
-                          │  │         │                │              │
-                          │  │         │  publish   ┌───┴────┐         │
-                          │  │         ├───────────►│ Kafka  │         │
-                          │  └─────────┘            └───┬────┘         │
-                          │                             │              │
-                          │              ┌──────────────┼──────────┐   │
-                          │              │   Consumers  │          │   │
-                          │              │              │          │   │
-                          │              │  ┌───────────▼───────┐  │   │
-                          │              │  │    DB Writer      │──┼───┘
-                          │              │  │  (persistence)    │  │
-                          │              │  ├───────────────────┤  │
-                          │              │  │  Audit Logger     │  │
-                          │              │  │  (audit trail)    │  │
-                          │              │  ├───────────────────┤  │
-                          │              │  │   Analytics       │  │
-                          │              │  │ (fraud metrics)   │  │
-                          │              │  └───────────────────┘  │
-                          │              └─────────────────────────┘
-                          └─────────────────────────────────────────────┘
+            POST /transactions
+  Client ──────────────────────►┌──────────────┐  atomic Lua    ┌───────┐
+         ◄──────────────────────┤  API         ├───────────────►│ Redis │  1h sliding window
+            APPROVE / DENY      │  (FastAPI)   │◄───────────────┤       │  30d avg cache
+                                │              │                └───────┘
+                                │              │  ONE transaction:
+                                │              ├──────────────────────────►┌──────────┐
+                                └──────────────┘  transactions + outbox    │ Postgres │
+                                                                           └────┬─────┘
+                                                      poll unpublished rows     │
+                                ┌──────────────┐◄───────────────────────────────┘
+                                │ Outbox relay │  acks=all, keyed by user_id
+                                └──────┬───────┘
+                                       ▼
+                         ┌──────────────────────────┐        ┌──────────────────┐
+                         │ Kafka: transactions (×6) │───────►│ transactions.dlq │
+                         └──────┬────────────┬──────┘        └──────────────────┘
+                   group=audit  │            │ group=analytics        ▲
+                                ▼            ▼                        │ poison /
+                       ┌──────────────┐ ┌──────────────┐              │ exhausted
+                       │ audit-writer │ │  analytics   │──────────────┘ retries
+                       │ → audit_log  │ │ → Prometheus │
+                       └──────────────┘ └──────────────┘
+
+  Prometheus scrapes api, relay, consumers, kafka-exporter → Grafana dashboard
 ```
 
-### Data Flow
+### Request path (synchronous, what the client waits for)
 
-1. **Transaction arrives** at the FastAPI service via `POST /transactions`
-2. **Feature lookup** from Redis using sorted-set sliding windows (sub-millisecond). Falls back to PostgreSQL if Redis is unavailable
-3. **Rule engine** evaluates features (velocity checks, amount spike detection)
-4. **Decision returned** to the client immediately
-5. **Redis updated** with new transaction data for future lookups
-6. **Event published** to Kafka for async downstream processing
-7. **Consumers** independently handle persistence, audit logging, and analytics
+1. **Idempotency check.** If `transaction_id` already exists, the stored decision is returned (`"idempotent": true`).
+2. **Features.** A Redis Lua script prunes, reads, and records the user's 1-hour window in one atomic step. The 30-day average comes from a cache with a 5-minute TTL (Postgres on a miss). If Redis is down, everything is computed from Postgres instead.
+3. **Rules.** More than 5 transactions in the last hour → `DENY too_many_txns_last_1h`. Amount more than 3× the 30-day average → `DENY amount_spike`. Otherwise `APPROVE`.
+4. **One Postgres transaction** writes the decision row and an outbox event row.
+5. **Return the decision.**
 
-### Key Design Decisions
+### Event path (asynchronous)
+
+6. The **outbox relay** publishes unpublished rows to Kafka (`acks=all`, keyed by `user_id`), then marks them published.
+7. **Consumers** (separate groups, so each one gets every event) commit offsets only after processing. They retry with backoff and send poison messages to `transactions.dlq`.
+   - `audit-writer`: append-only `audit_log` table, idempotent insert.
+   - `analytics`: decision counts and end-to-end pipeline latency for Prometheus.
+
+## Design decisions
 
 | Decision | Why |
-|----------|-----|
-| Redis sorted sets for sliding windows | True sliding window (not tumbling). Accurate 1-hour counts regardless of when you query |
-| Cache-aside with 5-min TTL for 30-day averages | A 30-day average barely changes per transaction — slight staleness is acceptable |
-| Kafka partitioned by user_id | Preserves per-user event ordering across consumers |
-| Idempotent DB writer (ON CONFLICT DO NOTHING) | At-least-once delivery + idempotent writes = effectively exactly-once |
-| Synchronous DB write + async Kafka publish | Reliability over pure performance — DB is the durability guarantee |
+|---|---|
+| Lua script for the velocity window | Read-then-write let concurrent requests see the same stale count and all pass the limit. Redis runs a script without interleaving other commands, so each request sees a distinct count. |
+| Sorted set per user, member `"{amount}:{txn_id}"`, scored by timestamp | A true sliding window, not a tumbling one. Entries older than an hour are pruned on every access, and the key has a 1-hour TTL so idle users disappear. |
+| Transactional outbox instead of publishing from the API | A DB commit and a Kafka send can't be atomic. With an outbox, "decision saved" and "event will be published" commit together. The API also doesn't depend on Kafka at all. |
+| Relay uses `acks=all`, `max_in_flight=1` | An event counts as sent only once it's fully replicated, and retries can't reorder it. |
+| Manual offset commits after processing | At-least-once delivery: a crash means redelivery, not loss. Consumers are idempotent, so redelivery is safe. |
+| DLQ with error headers | One bad message can't block a partition forever. The original bytes are kept for replay. |
+| Transient errors retry forever, not DLQ | If Postgres is down, the messages are fine and the dependency isn't. Dead-lettering would dump everything into the DLQ. |
+| 6 partitions keyed by `user_id` | Per-user ordering, with up to 6 consumers per group working in parallel. |
+| Idempotency on `transaction_id` (primary key) | A client retry, or two concurrent duplicates, gets the one original decision and never a second charge. |
+| Redis socket timeout of 0.5s plus Postgres fallback | A dead Redis fails fast and degrades to slower DB queries instead of hanging requests. |
 
-## Tech Stack
+## Failure modes
 
-| Layer | Technology | Purpose |
-|-------|-----------|---------|
-| API | Python, FastAPI | Transaction scoring, feature reads |
-| Feature Store | Redis | Sub-millisecond feature lookups, sliding window counters |
-| Event Streaming | Apache Kafka (KRaft) | Async event fan-out to consumers |
-| Database | PostgreSQL | Durable transaction storage |
-| ML | scikit-learn | Logistic regression fraud classifier |
-| Containerization | Docker, Docker Compose | Full-stack orchestration |
+| Failure | What happens |
+|---|---|
+| Redis down | Features are computed from Postgres (`fraud_feature_store_fallback_total` goes up). Requests still succeed, but the velocity check is no longer atomic while degraded. |
+| Kafka down | The API is unaffected. Events wait in the outbox (`fraud_outbox_pending` grows) and are delivered when Kafka returns. |
+| Consumers behind | Kafka buffers on disk. Lag shows as `kafka_consumergroup_lag`. Add consumer instances, up to 6 per group. |
+| Same message delivered twice | `audit_log` insert is `ON CONFLICT DO NOTHING`; analytics de-dupes on `event_id`. |
+| Same request sent twice | The primary key on `transaction_id` returns the original decision. |
+| Poison message | Sent to `transactions.dlq` with error, source partition, and offset headers, then the offset is committed. |
+| Relay crashes mid-batch | Rows weren't marked published, so they're re-sent. That's a duplicate, which consumers handle. |
 
-## Project Structure
+Two of these are tested automatically by stopping containers in CI: Redis down and Kafka down.
 
-```
-├── api/                    # FastAPI transaction scoring service
-│   ├── main.py             # API endpoints and request handling
-│   ├── feature_store.py    # Redis-backed feature reads/writes
-│   ├── redis_client.py     # Redis connection pool
-│   ├── kafka_producer.py   # Event publishing to Kafka
-│   ├── events.py           # Pydantic event schemas
-│   ├── features.py         # PostgreSQL fallback feature computation
-│   ├── rules.py            # Rule engine
-│   ├── models.py           # SQLAlchemy ORM models
-│   ├── database.py         # Database session management
-│   ├── config.py           # Environment-based configuration
-│   ├── requirements.txt
-│   └── Dockerfile
-│
-├── consumers/              # Kafka consumer workers
-│   ├── main.py             # Consumer runner (all consumers in threads)
-│   ├── db_writer.py        # Persists events to PostgreSQL
-│   ├── audit_logger.py     # Structured audit trail
-│   ├── analytics.py        # Running fraud metrics
-│   ├── config.py           # Consumer configuration
-│   ├── requirements.txt
-│   └── Dockerfile
-│
-├── ml/                     # ML training pipeline
-│   ├── train_model.py      # Model training and evaluation
-│   ├── artifacts/          # Trained model + metadata
-│   │   └── model_v1_meta.json
-│   └── requirements.txt
-│
-├── docker-compose.yml      # Full stack: Postgres, Redis, Kafka, API, Consumers
-├── .env.example            # Environment variable template
-└── info.md                 # Design notes and interview prep
-```
+## Running it
 
-## Quick Start
-
-### Prerequisites
-
-- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-
-### Run the full stack
+Requires Docker.
 
 ```bash
-docker-compose up --build
+docker compose up -d --build
 ```
 
-This starts PostgreSQL, Redis, Kafka, the API server, and all Kafka consumers.
-
-### Test a transaction
+| Service | URL |
+|---|---|
+| API (+ Swagger at `/docs`) | http://localhost:8000 |
+| Grafana dashboard | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
 
 ```bash
-# Score a transaction
 curl -X POST http://localhost:8000/transactions \
   -H "Content-Type: application/json" \
   -d '{"transaction_id": "txn-001", "user_id": "user-123", "amount": 49.99}'
 
-# Check health
-curl http://localhost:8000/health
+# Inspect the sliding window
+docker compose exec redis redis-cli ZRANGE user:user-123:txns_1h 0 -1 WITHSCORES
 
-# Look up a transaction
-curl http://localhost:8000/transactions/txn-001
+# Inspect the audit trail written by the Kafka consumer
+docker compose exec postgres psql -U fraud_user -d fraud_db -c "SELECT * FROM audit_log LIMIT 5"
 ```
 
-### Verify the pipeline
+## Testing
 
 ```bash
-# Check Redis has the sliding window data
-docker-compose exec redis redis-cli ZRANGE user:user-123:txns_1h 0 -1 WITHSCORES
+python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt   # .venv\Scripts on Windows
 
-# Watch Kafka consumer logs
-docker-compose logs -f consumers
+ruff check .
+pytest api/tests           # rules, Lua window (incl. concurrency), cache, fallback
+pytest consumers/tests     # retry / DLQ / transient-error logic, de-duplication
+
+# Against the running stack:
+INTEGRATION=1 pytest tests/integration/test_pipeline.py     # end-to-end, burst, DLQ, partitions
+INTEGRATION=1 pytest tests/integration/test_degradation.py  # stops Redis and Kafka
 ```
 
-## API Endpoints
+CI (`.github/workflows/ci.yml`) runs all of the above, then the load test, on every push.
+
+## Load testing
+
+```bash
+k6 run loadtest/k6.js                               # 200 tx/s for 60s
+k6 run -e RATE=500 -e DURATION=2m loadtest/k6.js
+```
+
+The test uses an open model (`constant-arrival-rate`): requests arrive at a fixed rate whether or not the server keeps up. A run counts as sustained only if `dropped_iterations` is 0 and errors are under 1%. Results are written to `loadtest/results/summary.md`.
+
+### Results
+
+_Not yet measured. Fill in from a real run, and say what hardware it ran on._
+
+| Environment | Sustained rate | p50 | p99 | Errors |
+|---|---|---|---|---|
+| — | — | — | — | — |
+
+## Endpoints
 
 | Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Service health + ML model status |
-| `POST` | `/transactions` | Score a transaction (rule engine + features) |
-| `GET` | `/transactions/{id}` | Look up a stored transaction |
-| `POST` | `/ml/score-kaggle` | Score Kaggle-format features with ML model |
+|---|---|---|
+| `POST` | `/transactions` | Score a transaction |
+| `GET` | `/transactions/{id}` | Look up a stored decision |
+| `GET` | `/health` | Liveness, plus whether the ML model is loaded |
+| `GET` | `/metrics` | Prometheus metrics |
+| `POST` | `/ml/score-kaggle` | Experimental ML scoring (see below) |
 
-## System Design Concepts
+## ML (experimental, not in the decision path)
 
-This project demonstrates several concepts commonly discussed in system design interviews:
+`ml/train_model.py` trains a logistic regression on the [Kaggle credit card fraud dataset](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud). It uses `class_weight="balanced"`, and the threshold is tuned for at least 85% recall. It's served at `/ml/score-kaggle`. Its inputs are the dataset's anonymized PCA columns (V1–V28) plus Amount. A live `{user_id, amount}` transaction doesn't have those, so the model is kept separate from the rule-based decision path. The next step is retraining on features the live system does compute.
 
-- **Cache-aside pattern** — check Redis first, query DB on miss, populate cache
-- **Sliding windows via sorted sets** — accurate time-windowed aggregates without scheduled jobs
-- **Hot/warm/cold data separation** — 1h counters (Redis), 30d averages (cached), full history (PostgreSQL)
-- **Event-driven architecture** — Kafka decouples scoring from downstream processing
-- **At-least-once + idempotent consumers** — effectively exactly-once without transaction overhead
-- **Graceful degradation** — Redis failure falls back to DB; Kafka failure doesn't block the API
-- **12-factor configuration** — environment variables, no hardcoded connection strings
+## Project structure
+
+```
+api/                  FastAPI service + outbox relay (same image)
+  main.py             request handling
+  feature_store.py    Redis Lua sliding window, 30d cache, fallback
+  features.py         Postgres fallback queries
+  rules.py            rule engine
+  models.py           transactions + outbox tables
+  relay.py            outbox → Kafka publisher
+  metrics.py          Prometheus metrics
+  ml_router.py        experimental ML endpoint
+consumers/            Kafka consumers (one process, one thread each)
+  runner.py           manual commits, retries, DLQ
+  audit_writer.py     audit_log table
+  analytics.py        stream metrics
+ml/                   offline training
+monitoring/           Prometheus config, Grafana provisioning + dashboard
+loadtest/             k6 script
+tests/integration/    end-to-end and failure-mode tests
+```

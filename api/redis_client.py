@@ -2,7 +2,7 @@ import logging
 
 import redis
 
-from config import REDIS_URL
+from config import REDIS_TIMEOUT_SECONDS, REDIS_URL
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,12 @@ _pool: redis.ConnectionPool | None = None
 def _get_pool() -> redis.ConnectionPool:
     global _pool
     if _pool is None:
-        _pool = redis.ConnectionPool.from_url(REDIS_URL, decode_responses=True)
+        _pool = redis.ConnectionPool.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=REDIS_TIMEOUT_SECONDS,
+            socket_timeout=REDIS_TIMEOUT_SECONDS,
+        )
     return _pool
 
 
