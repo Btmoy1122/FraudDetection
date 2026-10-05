@@ -17,14 +17,14 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Response
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest, multiprocess
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import ml_router
-from config import KAFKA_TRANSACTION_TOPIC
-from database import Base, engine, get_db
+from config import KAFKA_TRANSACTION_TOPIC, PROMETHEUS_MULTIPROC_DIR
+from database import get_db
 from events import TransactionEvent
 from feature_store import forget_transaction, get_features
 from features import compute_avg_30d_from_db, compute_features_from_db
@@ -35,8 +35,6 @@ from rules import apply_rules
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-Base.metadata.create_all(bind=engine)
 
 
 @asynccontextmanager
@@ -76,6 +74,14 @@ def health_check():
 
 @app.get("/metrics")
 def metrics():
+    # With several uvicorn workers each process has its own counters, so a
+    # scrape would only see whichever worker answered.  In multiprocess mode
+    # every worker writes to files in PROMETHEUS_MULTIPROC_DIR and this
+    # aggregates them.
+    if PROMETHEUS_MULTIPROC_DIR:
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 

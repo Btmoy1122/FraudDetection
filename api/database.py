@@ -1,11 +1,11 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from config import DATABASE_URL
+from config import DATABASE_URL, DB_MAX_OVERFLOW, DB_POOL_SIZE
 
-# FastAPI runs sync endpoints in a 40-thread pool; size the connection pool
-# so request threads aren't queued behind SQLAlchemy's default of 5.
-engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=10, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL, pool_size=DB_POOL_SIZE, max_overflow=DB_MAX_OVERFLOW, pool_pre_ping=True
+)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

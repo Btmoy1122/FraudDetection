@@ -12,6 +12,9 @@ on:
       duration:
         description: "Load test duration"
         default: "60s"
+      api_workers:
+        description: "uvicorn workers for the API"
+        default: "4"
 
 jobs:
   lint-and-unit:
@@ -34,6 +37,8 @@ jobs:
   integration:
     needs: lint-and-unit
     runs-on: ubuntu-24.04
+    env:
+      API_WORKERS: ${{ inputs.api_workers || '4' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -78,6 +83,7 @@ jobs:
             -e RATE=${{ inputs.rate || '100' }} \
             -e DURATION=${{ inputs.duration || '30s' }} \
             -e P99_MS=1000 \
+            -e API_WORKERS="$API_WORKERS" \
             loadtest/k6.js || status=$?
           cat loadtest/results/summary.md >> "$GITHUB_STEP_SUMMARY" || true
           exit $status

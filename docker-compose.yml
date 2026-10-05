@@ -88,6 +88,10 @@ services:
       DATABASE_URL: *db-url
       REDIS_URL: redis://redis:6379/0
       ARTIFACTS_DIR: /app/artifacts
+      # Python's GIL limits one process to one core; several workers use
+      # several cores.  Metrics from all workers are aggregated via files.
+      API_WORKERS: ${API_WORKERS:-4}
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
     volumes:
       - ./ml/artifacts:/app/artifacts:ro
     # The API depends on Postgres and Redis only.  Kafka is reached through
