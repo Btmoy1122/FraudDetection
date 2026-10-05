@@ -15,10 +15,10 @@ on:
 
 jobs:
   lint-and-unit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -33,10 +33,10 @@ jobs:
 
   integration:
     needs: lint-and-unit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -71,16 +71,20 @@ jobs:
       - name: Load test
         run: |
           mkdir -p loadtest/results
+          # k6 exits 99 when a threshold fails; still publish the summary
+          # (a failed run at a high rate is how the ceiling is found).
+          status=0
           k6 run \
             -e RATE=${{ inputs.rate || '100' }} \
             -e DURATION=${{ inputs.duration || '30s' }} \
             -e P99_MS=1000 \
-            loadtest/k6.js
-          cat loadtest/results/summary.md >> "$GITHUB_STEP_SUMMARY"
+            loadtest/k6.js || status=$?
+          cat loadtest/results/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+          exit $status
 
       - name: Upload load test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: loadtest-results
           path: loadtest/results/

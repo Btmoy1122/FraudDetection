@@ -129,11 +129,13 @@ The test uses an open model (`constant-arrival-rate`): requests arrive at a fixe
 
 ### Results
 
-_Not yet measured. Fill in from a real run, and say what hardware it ran on._
+All 10 containers and k6 share one machine, so these numbers are conservative.
 
-| Environment | Sustained rate | p50 | p99 | Errors |
-|---|---|---|---|---|
-| — | — | — | — | — |
+| Environment | Target rate | Requests | Dropped | p50 | p95 | p99 | Max | Errors |
+|---|---|---|---|---|---|---|---|---|
+| GitHub Actions `ubuntu-latest` runner, full stack | 100 tx/s × 30s | 3,001 | 0 | 4.5 ms | 8.5 ms | 13.7 ms | 51.2 ms | 0.00% |
+
+The 100 tx/s run is a CI smoke test, not a ceiling. The highest sustained rate is still to be measured. Run the workflow manually at increasing rates to find it.
 
 ## Endpoints
 
