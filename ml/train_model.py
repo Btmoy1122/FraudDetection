@@ -25,7 +25,7 @@ def select_threshold_by_recall(y_true, probs, target_recall=TARGET_RECALL):
 
     candidates = []
     for threshold, precision, recall in zip(
-        candidate_thresholds, candidate_precisions, candidate_recalls
+        candidate_thresholds, candidate_precisions, candidate_recalls, strict=True
     ):
         if recall >= target_recall:
             candidates.append(

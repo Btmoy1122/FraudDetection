@@ -1,38 +1,35 @@
 """Fraud Detection API — FastAPI service.
 
-Transaction flow:
-    1. Read features from Redis (falls back to PostgreSQL)
-    2. Apply rule engine
-    3. Persist to PostgreSQL (durable write)
-    4. Update Redis counters (so next request sees fresh data)
-    5. Publish event to Kafka (fire-and-forget for async consumers)
-    6. Return decision
+Transaction flow (POST /transactions):
+    1. Idempotency check: a known transaction_id returns its stored decision
+    2. Features: atomic Redis sliding window + cached 30-day average
+       (falls back to Postgres if Redis is down)
+    3. Rule engine → APPROVE / DENY
+    4. ONE Postgres transaction writes the decision AND an outbox event
+    5. Return the decision
 
-The DB write stays synchronous for reliability.  Redis accelerates
-the read path; Kafka decouples downstream processing (audit, analytics)
-from the user-facing response.
+The API never talks to Kafka.  relay.py publishes outbox rows to Kafka
+asynchronously, so a Kafka outage can't slow down or fail a decision, and
+an event can't be lost between "saved" and "published".
 """
 
-import json
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
 
-import joblib
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, HTTPException, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from config import ARTIFACTS_DIR
-from database import SessionLocal, engine
+import ml_router
+from config import KAFKA_TRANSACTION_TOPIC
+from database import Base, engine, get_db
 from events import TransactionEvent
-from feature_store import read_features, update_features
-from features import compute_features_from_db
-from kafka_producer import close as close_kafka
-from kafka_producer import flush as flush_kafka
-from kafka_producer import publish_transaction_event
-from models import Base, TransactionDB
+from feature_store import forget_transaction, get_features
+from features import compute_avg_30d_from_db, compute_features_from_db
+from metrics import DECISION_LATENCY, DECISIONS, IDEMPOTENT_REPLAYS
+from models import OutboxDB, TransactionDB
 from redis_client import close_pool
 from rules import apply_rules
 
@@ -41,144 +38,115 @@ logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 
-MODEL_PATH = ARTIFACTS_DIR / "model_v1.pkl"
-MODEL_META_PATH = ARTIFACTS_DIR / "model_v1_meta.json"
-
-ml_model = None
-ml_metadata: dict[str, Any] = {}
-
-
-# ---------------------------------------------------------------------------
-# Lifespan (startup / shutdown)
-# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_ml_artifacts()
+    ml_router.load_ml_artifacts()
     logger.info("Application started")
     yield
-    flush_kafka()
-    close_kafka()
     close_pool()
     logger.info("Application shut down")
 
 
 app = FastAPI(title="Fraud Detection API", lifespan=lifespan)
+app.include_router(ml_router.router)
 
-
-def load_ml_artifacts() -> None:
-    global ml_model, ml_metadata
-    if not MODEL_PATH.exists() or not MODEL_META_PATH.exists():
-        ml_model = None
-        ml_metadata = {}
-        logger.warning("ML model artifacts not found at %s", ARTIFACTS_DIR)
-        return
-    with MODEL_META_PATH.open("r", encoding="utf-8") as f:
-        ml_metadata = json.load(f)
-    ml_model = joblib.load(MODEL_PATH)
-    logger.info("Loaded ML model %s", ml_metadata.get("model_version"))
-
-
-# ---------------------------------------------------------------------------
-# Request / response schemas
-# ---------------------------------------------------------------------------
 
 class TransactionRequest(BaseModel):
-    transaction_id: str
-    user_id: str
-    amount: float
+    transaction_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1, max_length=128)
+    amount: float = Field(gt=0)
 
 
-class KaggleScoreRequest(BaseModel):
-    features: dict[str, float]
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "ml_model_loaded": ml_model is not None}
-
-
-@app.post("/ml/score-kaggle")
-def score_kaggle_transaction(payload: KaggleScoreRequest):
-    return _score_kaggle_features(payload.features)
-
-
-@app.post("/transactions")
-def create_transaction(txn: TransactionRequest):
-    db = SessionLocal()
-    try:
-        def db_fallback(uid):
-            return compute_features_from_db(uid, db)
-
-        features = read_features(txn.user_id, db_fallback=db_fallback)
-
-        decision, reason = apply_rules(features, txn.amount)
-
-        db_txn = TransactionDB(
-            transaction_id=txn.transaction_id,
-            user_id=txn.user_id,
-            amount=txn.amount,
-            decision=decision,
-            reason=reason,
-            features=features,
-        )
-        db.add(db_txn)
-        db.commit()
-
-        update_features(txn.user_id, txn.transaction_id, txn.amount)
-
-        event = TransactionEvent.from_transaction(
-            transaction_id=txn.transaction_id,
-            user_id=txn.user_id,
-            amount=txn.amount,
-            decision=decision,
-            reason=reason,
-            features=features,
-        )
-        publish_transaction_event(event.model_dump())
-
-    except IntegrityError:
-        db.rollback()
-        existing = (
-            db.query(TransactionDB)
-            .filter(TransactionDB.transaction_id == txn.transaction_id)
-            .first()
-        )
-        if existing:
-            return {
-                "transaction_id": existing.transaction_id,
-                "decision": existing.decision,
-                "reason": existing.reason,
-                "features": existing.features,
-                "idempotent": True,
-            }
-        raise
-    finally:
-        db.close()
-
+def _stored_response(txn: TransactionDB) -> dict:
+    IDEMPOTENT_REPLAYS.inc()
     return {
         "transaction_id": txn.transaction_id,
-        "decision": decision,
-        "reason": reason,
-        "features": features,
-        "idempotent": False,
+        "decision": txn.decision,
+        "reason": txn.reason,
+        "features": txn.features,
+        "idempotent": True,
     }
 
 
-@app.get("/transactions/{transaction_id}")
-def get_transaction(transaction_id: str):
-    db = SessionLocal()
-    txn = (
-        db.query(TransactionDB)
-        .filter(TransactionDB.transaction_id == transaction_id)
-        .first()
-    )
-    db.close()
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "ml_model_loaded": ml_router.model_loaded()}
 
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/transactions")
+def create_transaction(txn: TransactionRequest, db: Session = Depends(get_db)):
+    with DECISION_LATENCY.time():
+        # Fast path for client retries.  Concurrent duplicates that both get
+        # past this check are caught by the primary key below.
+        existing = db.get(TransactionDB, txn.transaction_id)
+        if existing:
+            return _stored_response(existing)
+
+        features = get_features(
+            txn.user_id,
+            txn.transaction_id,
+            txn.amount,
+            db_features=lambda uid: compute_features_from_db(uid, db),
+            db_avg=lambda uid: compute_avg_30d_from_db(uid, db),
+        )
+        decision, reason = apply_rules(features, txn.amount)
+
+        event = TransactionEvent(
+            transaction_id=txn.transaction_id,
+            user_id=txn.user_id,
+            amount=txn.amount,
+            decision=decision,
+            reason=reason,
+            features=features,
+        )
+        db.add(TransactionDB(
+            transaction_id=txn.transaction_id,
+            user_id=txn.user_id,
+            amount=txn.amount,
+            decision=decision,
+            reason=reason,
+            features=features,
+        ))
+        db.add(OutboxDB(
+            topic=KAFKA_TRANSACTION_TOPIC,
+            key=txn.user_id,
+            payload=event.model_dump(),
+        ))
+
+        try:
+            db.commit()
+        except IntegrityError:
+            # Lost a race with a concurrent request for the same
+            # transaction_id — answer with the winner's decision.
+            db.rollback()
+            existing = db.get(TransactionDB, txn.transaction_id)
+            if existing is None:
+                raise
+            return _stored_response(existing)
+        except Exception:
+            db.rollback()
+            forget_transaction(txn.user_id, txn.transaction_id, txn.amount)
+            raise
+
+        DECISIONS.labels(decision=decision, reason=reason).inc()
+        return {
+            "transaction_id": txn.transaction_id,
+            "decision": decision,
+            "reason": reason,
+            "features": features,
+            "idempotent": False,
+        }
+
+
+@app.get("/transactions/{transaction_id}")
+def get_transaction(transaction_id: str, db: Session = Depends(get_db)):
+    txn = db.get(TransactionDB, transaction_id)
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
@@ -187,37 +155,5 @@ def get_transaction(transaction_id: str):
         "user_id": txn.user_id,
         "amount": txn.amount,
         "decision": txn.decision,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _score_kaggle_features(features: dict[str, float]) -> dict[str, Any]:
-    if ml_model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="ML model artifacts are not loaded.",
-        )
-
-    feature_cols = ml_metadata.get("feature_cols", [])
-    threshold = float(ml_metadata.get("threshold", 0.5))
-    model_version = ml_metadata.get("model_version", "unknown")
-
-    missing = [col for col in feature_cols if col not in features]
-    if missing:
-        raise HTTPException(
-            status_code=422, detail=f"Missing features: {missing}"
-        )
-
-    feature_vector = [[float(features[col]) for col in feature_cols]]
-    ml_score = float(ml_model.predict_proba(feature_vector)[0][1])
-    ml_decision = "DENY" if ml_score >= threshold else "APPROVE"
-
-    return {
-        "ml_score": ml_score,
-        "ml_threshold": threshold,
-        "ml_decision": ml_decision,
-        "model_version": model_version,
+        "reason": txn.reason,
     }

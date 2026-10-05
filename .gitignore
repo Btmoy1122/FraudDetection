@@ -23,3 +23,7 @@ fraud-backend/venv/
 
 # Docker
 postgres_data/
+
+# Load test output
+loadtest/results/*
+!loadtest/results/.gitkeep
