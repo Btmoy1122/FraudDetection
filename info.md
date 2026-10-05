@@ -207,17 +207,33 @@ Why a histogram for latency: averages hide tail latency, and p99 is what users f
 
 A run is "sustained" only if `dropped_iterations == 0` and errors are under 1%.
 
-**Measured results** (GitHub Actions runner, 4 vCPU, whole stack plus k6 on one machine, one uvicorn worker):
-- 100 tx/s: p50 4.5 ms, p99 13.7 ms.
-- 200 tx/s: 0 errors, 0 dropped, p50 3.7 ms, p99 396 ms. This is the highest sustained rate.
-- 500 tx/s: saturated at about 324 tx/s achieved, with ~6 s latency, 8,974 dropped iterations, and still 0 errors.
+**Measured results** (GitHub Actions runner, 4 vCPU, whole stack plus k6 on one machine):
 
-**How to explain them:**
-- *Why does p99 jump at 200 while p50 stays flat?* Queueing. At about 60% of capacity, bursts briefly exceed what one worker can handle, and the requests that arrive during a burst wait. The median request never waits; the unlucky 1% do.
-- *How do you know the ceiling is ~325?* At 500, k6 hit its 2,000-VU cap. Little's Law (L = λW) gives λ = L / W = 2,000 / 6.2 s ≈ 323 tx/s, which matches the measured 324. Throughput was capped by how fast the server finishes requests, not by the load generator.
-- *Zero errors at 500?* Overload showed up as queueing (latency), not failures. The next step would be load shedding: reject early with 503 once the queue is too deep, so latency stays bounded.
+| Workers | Target | Achieved | Dropped | p50 | p99 | Errors |
+|---|---|---|---|---|---|---|
+| 1 | 100 | 100 | 0 | 4.5 ms | 13.7 ms | 0% |
+| 1 | 200 | 200 | 0 | 3.7 ms | 396 ms | 0% |
+| 1 | 500 | 324 | 8,974 | 6.0 s | 6.7 s | 0% |
+| 1 | 500 | 200 | 16,432 | 9.9 s | 14.2 s | 0% |
+| 4 | 500 | 500 | 0 | 184 ms | 1.01 s | 0% |
 
-**Never put a number on your resume that you didn't measure.** Run it, record the hardware, and use the real numbers. Expect the bottleneck to be the single uvicorn worker (Python, GIL) and the synchronous Postgres commit per request. Be ready to say that, and how you'd scale: more API replicas behind a load balancer (the API is stateless), PgBouncer, and async DB drivers.
+**The story (measure → hypothesis → change → re-measure):**
+1. **Measure.** One worker sustained 200 tx/s, but at a 500 target it saturated around 200–325 tx/s, with multi-second latency.
+2. **Hypothesis.** Python's GIL means one process uses one core, so the single uvicorn worker is the bottleneck.
+3. **Change.** Run 4 workers. That required:
+   - Prometheus multiprocess mode, so metrics from every worker are aggregated rather than showing only whichever worker answered the scrape.
+   - Moving `CREATE TABLE` into a one-time init step, so 4 processes don't race on a fresh database.
+   - Shrinking the per-worker DB pool, since 4 × 30 connections would exceed Postgres's default of 100.
+4. **Re-measure.** At the same 500 tx/s target, achieved throughput went from ~200 to 500 tx/s (~2.5×). Dropped requests went from 16k to 0, and errors stayed at 0.
+
+**How to explain the numbers:**
+- *Why does p99 jump at 200 (1 worker) while p50 stays flat?* Queueing. Bursts briefly exceed what one worker can serve, and only the requests that arrive during a burst wait.
+- *How do you know 1 worker's ceiling?* At 500, k6 hit its 2,000-VU cap. Little's Law (L = λW): λ = 2,000 / 6.2 s ≈ 323 tx/s, which matches the measured 324.
+- *Why do the two 1-worker runs differ (324 vs 200)?* Shared CI machines are noisy neighbors. That's why I compare 1 vs 4 workers at the same rate, and quote a range, not the best number.
+- *Why not 4× with 4 workers?* All 10 containers and k6 share 4 vCPUs. At 500 tx/s, p50 is already 184 ms, so the machine's CPU is the next limit. In production the API is stateless, so you'd add replicas on separate hosts behind a load balancer.
+- *Zero errors even when saturated?* Overload showed up as queueing, not failures. The next step would be load shedding (return 503 early when the queue is deep) so latency stays bounded.
+
+**Never put a number on your resume that you didn't measure.** Run it, record the hardware, and use the real numbers. Beyond 4 workers on one box, you'd scale with more API replicas on separate hosts behind a load balancer (the API is stateless), PgBouncer in front of Postgres, and async DB drivers.
 
 ---
 
@@ -235,7 +251,7 @@ A run is "sustained" only if `dropped_iterations == 0` and errors are under 1%.
 - The velocity check isn't atomic while Redis is down (Postgres fallback).
 - The Redis window is in memory; a Redis restart loses up to 1 hour of velocity history (could rebuild it from Postgres on a miss).
 - A single relay is a throughput ceiling; it could be partitioned by key hash or replaced with Debezium CDC.
-- A single uvicorn worker; you'd run multiple replicas in production.
+- One API container (4 workers) on one host; production would run several replicas behind a load balancer, with no load shedding yet.
 - No authentication or rate limiting on the API.
 - No schema registry; the event contract lives in Pydantic models.
 - There's no DLQ replay tool yet (messages are kept with their headers, so it's straightforward to add).
@@ -246,5 +262,5 @@ A run is "sustained" only if `dropped_iterations == 0` and errors are under 1%.
 
 - Built a real-time fraud scoring service (FastAPI, Redis, Kafka, Postgres) with atomic Redis Lua sliding-window velocity checks, fixing a race that let concurrent requests bypass limits.
 - Guaranteed event delivery with a transactional outbox and at-least-once Kafka consumers (manual commits, idempotent writes, dead-letter topic), verified by failure-injection tests that stop Redis and Kafka in CI.
-- Load-tested with k6 (open-model): sustained 200 tx/s with zero errors (p50 3.7 ms, p99 396 ms), peaking at about 325 tx/s on a shared 4-vCPU CI runner. Instrumented with Prometheus/Grafana (latency, consumer lag, fallback rate).
+- Load-tested with k6 and found a single-process (GIL) bottleneck capping throughput at ~200–325 tx/s. Moved to multi-worker serving, with aggregated Prometheus metrics and race-free schema init, and reached 500 tx/s with zero errors or dropped requests (~2.5× on the same hardware).
 - Containerized 9 services with Docker Compose; GitHub Actions CI runs lint, 36 unit tests, integration tests, and a load test on every push.

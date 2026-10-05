@@ -3,7 +3,7 @@
 // Uses an open model (constant-arrival-rate): k6 starts RATE requests per
 // second regardless of how fast the server answers, which is how real
 // traffic behaves.  If the server can't keep up, k6 reports
-// dropped_iterations > 0 — a run only counts as "sustained" when that's 0.
+// dropped_iterations > 0. A run counts as sustained only if every threshold passes.
 //
 //   k6 run loadtest/k6.js                         # 200 tx/s for 60s
 //   k6 run -e RATE=500 -e DURATION=2m loadtest/k6.js
@@ -83,7 +83,14 @@ export function handleSummary(data) {
     p99_ms: metric(data, 'http_req_duration', 'p(99)'),
     max_ms: metric(data, 'http_req_duration', 'max'),
   };
-  const sustained = r.dropped_iterations === 0 && r.error_rate < 0.01;
+  // Same verdict as k6's exit code: every threshold (errors, p99, drops) passed.
+  const failed = [];
+  for (const [name, m] of Object.entries(data.metrics)) {
+    for (const [expr, t] of Object.entries(m.thresholds || {})) {
+      if (!t.ok) failed.push(`${name} ${expr}`);
+    }
+  }
+  const sustained = failed.length === 0;
 
   const md = [
     '## Load test results',
@@ -97,7 +104,7 @@ export function handleSummary(data) {
     `| Error rate | ${(r.error_rate * 100).toFixed(2)}% |`,
     `| Latency p50 / p95 / p99 | ${r.p50_ms.toFixed(1)} / ${r.p95_ms.toFixed(1)} / ${r.p99_ms.toFixed(1)} ms |`,
     `| Max latency | ${r.max_ms.toFixed(1)} ms |`,
-    `| Sustained? | ${sustained ? 'yes' : 'NO — server could not keep up'} |`,
+    `| Passed all thresholds? | ${sustained ? 'yes' : `NO — failed: ${failed.join(', ')}`} |`,
     '',
   ].join('\n');
 
