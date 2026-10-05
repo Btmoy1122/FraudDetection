@@ -129,13 +129,17 @@ The test uses an open model (`constant-arrival-rate`): requests arrive at a fixe
 
 ### Results
 
-All 10 containers and k6 share one machine, so these numbers are conservative.
+All runs used a GitHub Actions Linux runner (4 vCPU) shared by all 10 containers and k6, with a single uvicorn worker.
 
-| Environment | Target rate | Requests | Dropped | p50 | p95 | p99 | Max | Errors |
+| Target rate | Duration | Achieved | Dropped | p50 | p95 | p99 | Errors | Sustained? |
 |---|---|---|---|---|---|---|---|---|
-| GitHub Actions `ubuntu-latest` runner, full stack | 100 tx/s × 30s | 3,001 | 0 | 4.5 ms | 8.5 ms | 13.7 ms | 51.2 ms | 0.00% |
+| 100 tx/s | 30s | 100.0 tx/s | 0 | 4.5 ms | 8.5 ms | 13.7 ms | 0.00% | yes |
+| **200 tx/s** | 60s | **200.0 tx/s** | 0 | **3.7 ms** | 171.5 ms | **396.3 ms** | 0.00% | **yes** |
+| 500 tx/s | 60s | 324.4 tx/s | 8,974 | 5,989 ms | 6,458 ms | 6,698 ms | 0.00% | no (saturated) |
 
-The 100 tx/s run is a CI smoke test, not a ceiling. The highest sustained rate is still to be measured. Run the workflow manually at increasing rates to find it.
+- **Sustained:** 200 tx/s with zero errors or dropped requests.
+- **Peak throughput:** about 325 tx/s. Beyond that, requests queue (the 500 tx/s run follows Little's Law: about 2,000 in flight ÷ about 6.2 s ≈ 323 tx/s), but nothing errors.
+- **Likely bottleneck:** the single Python worker (the GIL limits it to one core) plus a Postgres commit per request, on a machine shared with the rest of the stack. Not yet profiled.
 
 ## Endpoints
 
